@@ -1,8 +1,7 @@
-fastapi
-uvicorn[standard]
-duckdb
-geopandas
-shapely
-python-dotenv
-overturemaps
-APScheduler
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+duckdb>=0.10.0
+h3>=3.7.7
+shapely>=2.0.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0

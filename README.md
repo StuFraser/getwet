@@ -2,20 +2,27 @@
 
 > A lightweight, self-contained REST API for water body detection and classification — powered by Overture Maps data.
 
-Drop a coordinate anywhere in a supported region and instantly know whether it falls within a natural water body, what type it is, whether it's fresh or salt water, and what it's called. No third-party API calls at runtime. No billing surprises.
+Drop a coordinate anywhere in the world and instantly know whether it falls within a natural water body, what type it is, whether it's fresh or salt water, what it's called — and if you're not in water, how far you are from the nearest one.
+
+No regional data files. No upfront downloads. No billing surprises.
 
 ---
 
 ## ✨ Features
 
-- **Point-in-water detection** — Is a given lat/lng coordinate within a water body?
-- **Water type classification** — Ocean, lake, river, reservoir, estuary, harbour, and more
-- **Fresh vs. salt water** — Explicit `is_salt` flag on every response
-- **Named water bodies** — Returns the name of the water body where available
-- **Regional data bundles** — Download and cache Overture water data per region on startup
-- **Auto-refresh** — Configurable data freshness checks keep regional data current
-- **Simple API key auth** — Lightweight static key protection, no user management needed
-- **Zero runtime dependencies** — All queries run against a local GeoParquet/GeoJSON file
+- **Global coverage** — works for any coordinate on Earth, not just preconfigured regions
+- **On-demand tile fetching** — only fetches the ~250km² H3 tile covering your coordinate, straight from Overture's public S3
+- **In-memory tile cache** — subsequent queries in the same area are instant
+- **Point-in-water detection** — is a given lat/lng within a water body?
+- **Water type classification** — ocean, lake, river, reservoir, estuary, harbour, wetland, canal, and more
+- **Normalised categories** — clean canonical category alongside the raw Overture class
+- **Fresh vs. salt water** — inferred from water type where not explicitly available
+- **Multilingual names** — primary local name plus English translation where available
+- **Nearest water** — when not in water, returns the closest water body and distance in metres
+- **Adjustable margin** — consumer-controlled buffer to account for GPS or geometry imprecision
+- **Batch endpoint** — check up to 100 coordinates in a single request
+- **Auto-resolving Overture release** — always queries the latest Overture data via STAC catalog
+- **Simple API key auth** — lightweight static key protection, no user management needed
 
 ---
 
@@ -38,17 +45,19 @@ pip install -r requirements.txt
 
 ### Configuration
 
-Copy the example env file and configure it:
-
 ```bash
 cp .env.example .env
 ```
 
+Edit `.env`:
+
 ```env
 API_KEY=your-random-secret-key-here
-SUPPORTED_REGIONS=NZ
+CACHE_BACKEND=memory
 DATA_REFRESH_DAYS=30
 ```
+
+`OVERTURE_RELEASE` is optional — if not set, the latest release is resolved automatically from the Overture STAC catalog on startup.
 
 ### Run
 
@@ -56,9 +65,7 @@ DATA_REFRESH_DAYS=30
 uvicorn main:app --reload
 ```
 
-The API will be available at `http://localhost:8000`.
-
-On first startup, the service will automatically download Overture water data for each configured region. This may take a moment — subsequent startups will use the cached local data.
+The API is available at `http://localhost:8000`. On first query for any area, the service fetches just the relevant tile from Overture S3 — no upfront download required.
 
 ---
 
@@ -71,20 +78,21 @@ Check whether a coordinate falls within a water body.
 **Headers**
 
 | Header | Required | Description |
-|--------|----------|-------------|
+|---|---|---|
 | `X-API-Key` | ✅ | Your configured API key |
 
 **Query Parameters**
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `lat` | float | ✅ | Latitude |
-| `lng` | float | ✅ | Longitude |
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `lat` | float | ✅ | — | Latitude |
+| `lng` | float | ✅ | — | Longitude |
+| `margin_m` | float | ❌ | `10.0` | Buffer in metres applied to the point before polygon test. Accounts for GPS or geometry imprecision. Set to `0` for strict point-in-polygon. Max `500`. |
 
 **Example Request**
 
 ```bash
-curl -X GET "http://localhost:8000/water/check?lat=-36.8485&lng=174.7633" \
+curl -X GET "http://localhost:8000/water/check?lat=-36.8485&lng=174.7633&margin_m=10" \
   -H "X-API-Key: your-secret-key"
 ```
 
@@ -94,11 +102,14 @@ curl -X GET "http://localhost:8000/water/check?lat=-36.8485&lng=174.7633" \
 {
   "is_water": true,
   "name": "Waitemata Harbour",
+  "name_en": "Waitemata Harbour",
   "subtype": "water",
   "class": "harbour",
+  "category": "harbour",
   "is_salt": true,
   "is_intermittent": false,
-  "confidence": "high"
+  "confidence": "high",
+  "nearest_water": null
 }
 ```
 
@@ -108,56 +119,121 @@ curl -X GET "http://localhost:8000/water/check?lat=-36.8485&lng=174.7633" \
 {
   "is_water": false,
   "name": null,
+  "name_en": null,
   "subtype": null,
   "class": null,
+  "category": null,
   "is_salt": null,
   "is_intermittent": null,
-  "confidence": "high"
+  "confidence": "high",
+  "nearest_water": {
+    "name": "Waitemata Harbour",
+    "category": "harbour",
+    "class": "harbour",
+    "distance_m": 142
+  }
 }
 ```
 
+**Confidence values**
+
+| Value | Meaning |
+|---|---|
+| `high` | Point is well inside the polygon (>200m from boundary) |
+| `medium` | Point is close to the polygon boundary (50–200m) |
+| `low` | Point is very close to the boundary (<50m), or no data available for this area |
+
+---
+
+### `POST /water/batch`
+
+Check multiple coordinates in a single request.
+
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `X-API-Key` | ✅ | Your configured API key |
+
+**Request Body**
+
+```json
+{
+  "coordinates": [
+    { "lat": -36.8485, "lng": 174.7633 },
+    { "lat": -43.7841, "lng": 172.4364 }
+  ],
+  "margin_m": 10.0
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `coordinates` | array | ✅ | — | 1–100 `{lat, lng}` pairs |
+| `margin_m` | float | ❌ | `10.0` | Buffer in metres, applied to all coordinates |
+
+**Example Response**
+
+```json
+{
+  "results": [
+    {
+      "lat": -36.8485,
+      "lng": 174.7633,
+      "is_water": true,
+      "name": "Waitemata Harbour",
+      ...
+    }
+  ],
+  "count": 1
+}
+```
+
+> Coordinates sharing the same H3 tile (~250km²) use a single cache lookup, making batch requests within a region very efficient.
+
+---
+
 ### `GET /health`
 
-Service health check. Returns current status and data freshness per region.
+Service health check and cache statistics. No API key required.
 
 ```json
 {
   "status": "ok",
-  "regions": {
-    "NZ": {
-      "loaded": true,
-      "last_updated": "2026-02-01T00:00:00Z",
-      "age_days": 29
-    }
+  "cache": {
+    "backend": "memory",
+    "total_tiles": 4,
+    "total_features": 2341,
+    "oldest_tile": "2026-03-01T21:00:00+00:00",
+    "stale_tiles": 0,
+    "refresh_days": 30,
+    "overture_release": "2026-02-18.0"
   }
 }
 ```
 
 ---
 
-## 🗺️ Supported Regions
+### `POST /cache/evict`
 
-Regions are configured via the `SUPPORTED_REGIONS` environment variable as a comma-separated list.
+Manually evict stale tiles from the cache. Requires API key.
 
-| Code | Region |
-|------|--------|
-| `NZ` | New Zealand |
-| `AU` | Australia |
-| `UK` | United Kingdom |
+Tiles are also refreshed lazily on next query — this endpoint is optional, useful if you want to force a clean slate after pinning a new `OVERTURE_RELEASE`.
 
-Adding a new region is as simple as adding its code to the config — the service handles the rest on next startup.
+```json
+{ "evicted_tiles": 2 }
+```
 
 ---
 
-## 🛠️ Tech Stack
+## ⚙️ Configuration Reference
 
-| Component | Technology |
-|-----------|------------|
-| API Framework | FastAPI |
-| Query Engine | DuckDB |
-| Data Download | overturemaps CLI |
-| Geospatial | Shapely / GeoPandas |
-| Config | python-dotenv |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `API_KEY` | ✅ | — | Static API key for request authentication |
+| `CACHE_BACKEND` | ❌ | `memory` | Cache backend. Currently supports `memory` |
+| `DATA_REFRESH_DAYS` | ❌ | `30` | Days before a cached tile is considered stale |
+| `OVERTURE_RELEASE` | ❌ | auto | Pin a specific Overture release (e.g. `2026-02-18.0`). If unset, resolved from STAC on startup |
 
 ---
 
@@ -166,17 +242,39 @@ Adding a new region is as simple as adding its code to the config — the servic
 ```
 overture-water-api/
 ├── main.py              # FastAPI app & routes
-├── data/                # Local regional GeoJSON data files
-│   └── water_nz.geojson
-├── services/
-│   ├── water.py         # Point-in-water query logic
-│   └── data_manager.py  # Overture data download & refresh
-├── middleware/
-│   └── auth.py          # API key validation
+├── water.py             # Point-in-water query logic & classification
+├── tile_cache.py        # H3 tile orchestration & Overture S3 fetching
+├── cache/
+│   ├── __init__.py      # Backend factory (reads CACHE_BACKEND env var)
+│   ├── base.py          # Abstract cache interface
+│   └── memory.py        # In-memory backend
 ├── .env.example
 ├── requirements.txt
 └── Dockerfile
 ```
+
+---
+
+## 🧠 How It Works
+
+```
+Query arrives (lat, lng)
+        ↓
+Convert to H3 cell (resolution 5, ~250km²)
+        ↓
+Check in-memory tile cache
+  ├─ HIT + fresh  →  query local features  →  return result
+  └─ MISS / stale
+          ↓
+    Fetch bbox from Overture S3
+    (DuckDB spatial query on public Parquet files)
+          ↓
+    Store tile in memory cache
+          ↓
+    Query local features  →  return result
+```
+
+On a cold start for any given area, the first query fetches only the ~250km² tile covering that coordinate — typically 10–800 features depending on how water-dense the area is. Subsequent queries in the same area are served from memory with no network calls.
 
 ---
 
@@ -186,6 +284,19 @@ overture-water-api/
 docker build -t overture-water-api .
 docker run -p 8000:8000 --env-file .env overture-water-api
 ```
+
+---
+
+## 🛠️ Tech Stack
+
+| Component | Technology |
+|---|---|
+| API Framework | FastAPI |
+| Query Engine | DuckDB |
+| Spatial Index | Shapely STRtree |
+| Tile System | H3 (Uber) |
+| Data Source | Overture Maps S3 (public) |
+| Config | python-dotenv |
 
 ---
 
@@ -201,20 +312,15 @@ This service uses geospatial data from the **Overture Maps Foundation**.
 
 ### Overture Maps — Base/Water Theme
 
-The water feature data used by this service is sourced from the Overture Maps Foundation `base` theme and is distributed under the **Open Database License (ODbL) v1.0**, as it incorporates data derived from OpenStreetMap.
+The water feature data is sourced from the Overture Maps Foundation `base` theme and distributed under the **Open Database License (ODbL) v1.0**, as it incorporates data derived from OpenStreetMap.
 
 **Required attribution:**
-
 > © OpenStreetMap contributors, Overture Maps Foundation
 
 Under the ODbL:
 - You are free to use, modify, and distribute the data
 - Any derivative databases must also be licensed under ODbL
 - Attribution to both OpenStreetMap contributors and Overture Maps Foundation is required
-
-### OpenStreetMap
-
-Portions of the underlying data are © **OpenStreetMap contributors**, licensed under the [Open Database License (ODbL) v1.0](https://opendatacommons.org/licenses/odbl/1-0/).
 
 ### Full License Texts
 
@@ -228,7 +334,7 @@ Portions of the underlying data are © **OpenStreetMap contributors**, licensed 
 
 This project's source code is licensed under the [MIT License](LICENSE).
 
-Data used at runtime carries its own licensing terms as described in the Data Attribution section above.
+Data used at runtime carries its own licensing terms as described above.
 
 ---
 
@@ -237,3 +343,4 @@ Data used at runtime carries its own licensing terms as described in the Data At
 - [Overture Maps Foundation](https://overturemaps.org) — Open map data
 - [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) — Underlying community map data
 - [DuckDB](https://duckdb.org) — Blazing fast local analytics
+- [H3](https://h3geo.org) — Hexagonal spatial indexing

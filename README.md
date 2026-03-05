@@ -145,6 +145,44 @@ curl -X GET "http://localhost:8000/water/check?lat=-36.8485&lng=174.7633&margin_
 
 ---
 
+### `POST /cache/warm`
+
+Pre-warm the tile cache for a given location. Requires API key.
+
+Fetches the H3 cell covering the coordinate plus its 6 immediate neighbours (~7 × 250km² ring), storing all water features in the cache ahead of any query traffic. Only tiles that are missing or stale are fetched — safe to call repeatedly.
+
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `X-API-Key` | ✅ | Your configured API key |
+
+**Query Parameters**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `lat` | float | ✅ | Latitude of the centre point |
+| `lng` | float | ✅ | Longitude of the centre point |
+
+**Example Request**
+
+```bash
+curl -X POST "http://localhost:8000/cache/warm?lat=-36.8485&lng=174.7633" \
+  -H "X-API-Key: your-secret-key"
+```
+
+**Example Response**
+
+```json
+{
+  "status": "ok",
+  "warmed": 5,
+  "already_warm": 2
+}
+```
+
+> Useful on deploy or after an `OVERTURE_RELEASE` pin change to front-load the cold-start cost for a known area of interest, rather than absorbing it on live query traffic.
+
 ### `POST /water/batch`
 
 Check multiple coordinates in a single request.

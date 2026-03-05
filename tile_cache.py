@@ -11,6 +11,7 @@ Sits between the water query logic and the cache backend. Responsible for:
 
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -30,7 +31,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DATA_REFRESH_DAYS: int = int(os.getenv("DATA_REFRESH_DAYS", "30"))
 
-# If OVERTURE_RELEASE is set in .env, use it. Otherwise resolve from STAC.
 _OVERTURE_RELEASE_OVERRIDE: str | None = os.getenv("OVERTURE_RELEASE")
 
 
@@ -53,7 +53,7 @@ def _resolve_overture_release() -> str:
             logger.info("Resolved latest Overture release from STAC: %s", latest)
             return latest
     except Exception as exc:
-        fallback = "2026-02-18.0"
+        fallback = "2026-01-21.0"
         logger.warning(
             "Failed to resolve Overture release from STAC (%s) — using fallback: %s",
             exc, fallback,
@@ -80,6 +80,42 @@ BBOX_BUFFER_DEG: float = 0.05
 
 
 # ---------------------------------------------------------------------------
+# DuckDB connection helpers
+# ---------------------------------------------------------------------------
+
+def _init_connection(conn: duckdb.DuckDBPyConnection) -> None:
+    """
+    Install and load required DuckDB extensions on a fresh connection.
+    Safe to call once per connection — extensions persist for its lifetime.
+    """
+    conn.execute("INSTALL spatial; LOAD spatial;")
+    conn.execute("INSTALL httpfs;  LOAD httpfs;")
+    conn.execute("SET s3_region = 'us-west-2';")
+
+
+@contextmanager
+def duck_connection():
+    """
+    Context manager that yields an initialised DuckDB connection
+    and ensures it is closed on exit.
+
+    Use this when a single connection should span multiple tile fetches
+    where fetches are certain to be needed — e.g. cache warmup, where
+    the intent is always to fetch all tiles in the ring.
+
+    For on-demand paths (single check, batch with warm cache), connection
+    creation is deferred to _query_overture and only happens on actual
+    cache misses.
+    """
+    conn = duckdb.connect()
+    try:
+        _init_connection(conn)
+        yield conn
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # TileOrchestrator
 # ---------------------------------------------------------------------------
 class TileOrchestrator:
@@ -91,24 +127,69 @@ class TileOrchestrator:
     def __init__(self, cache: Optional[BaseTileCache] = None) -> None:
         self._cache = cache or get_cache()
 
-    def get_features_for_point(self, lat: float, lng: float) -> list[dict]:
+    def get_features_for_point(
+        self,
+        lat: float,
+        lng: float,
+        conn: Optional[duckdb.DuckDBPyConnection] = None,
+    ) -> list[dict]:
         """
         Return all water features relevant to (lat, lng).
         Fetches from Overture S3 on cache miss or stale tile.
+
+        conn: optional existing DuckDB connection to reuse. Only used if a
+        fetch is actually needed — cache hits return immediately without
+        touching DuckDB at all. When omitted and a fetch is required, a
+        fresh connection is created and closed inside _query_overture.
         """
         cell = h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
         cached = self._cache.get(cell)
 
         if cached is None:
             logger.info("Cache miss for H3 cell %s — fetching from Overture S3", cell)
-            return self._fetch_and_cache(cell)
+            return self._fetch_and_cache(cell, conn=conn)
 
         if self._is_stale(cached):
             logger.info("Stale tile for H3 cell %s — refreshing from Overture S3", cell)
-            return self._fetch_and_cache(cell)
+            return self._fetch_and_cache(cell, conn=conn)
 
         logger.debug("Cache hit for H3 cell %s (%d features)", cell, cached.feature_count)
         return cached.features
+
+    def warm(self, lat: float, lng: float) -> dict:
+        """
+        Pre-warm the cache for the given location and its H3 ring-1 neighbours
+        (the centre cell plus the 6 surrounding cells).
+
+        Only fetches tiles that are missing or stale — safe to call repeatedly.
+        A single DuckDB connection is created upfront and shared across all
+        fetches, since warm() always intends to fetch multiple tiles.
+        Returns a summary of what was warmed vs already cached.
+        """
+        centre = h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
+        cells = h3.grid_disk(centre, 1)  # centre + 6 neighbours = 7 cells
+
+        warmed = []
+        already_warm = []
+
+        with duck_connection() as conn:
+            for cell in cells:
+                cached = self._cache.get(cell)
+                if cached is None or self._is_stale(cached):
+                    self._fetch_and_cache(cell, conn=conn)
+                    warmed.append(cell)
+                else:
+                    already_warm.append(cell)
+
+        logger.info(
+            "Warm request for (%.6f, %.6f) — warmed %d tile(s), %d already cached",
+            lat, lng, len(warmed), len(already_warm),
+        )
+        return {
+            "status": "ok",
+            "warmed": len(warmed),
+            "already_warm": len(already_warm),
+        }
 
     def evict_stale(self) -> int:
         """Remove all stale tiles from the cache. Returns count evicted."""
@@ -142,10 +223,19 @@ class TileOrchestrator:
     def _stale_threshold(self) -> datetime:
         return datetime.now(timezone.utc) - timedelta(days=DATA_REFRESH_DAYS)
 
-    def _fetch_and_cache(self, cell: str) -> list[dict]:
-        """Query Overture S3 for water features within the H3 cell bbox."""
+    def _fetch_and_cache(
+        self,
+        cell: str,
+        conn: Optional[duckdb.DuckDBPyConnection] = None,
+    ) -> list[dict]:
+        """
+        Query Overture S3 for water features within the H3 cell bbox.
+
+        conn: optional existing DuckDB connection to reuse. When omitted,
+        _query_overture creates and closes its own connection internally.
+        """
         bbox = _cell_bbox(cell)
-        features = _query_overture(bbox)
+        features = _query_overture(bbox, conn=conn)
 
         tile = CachedTile(
             h3_cell=cell,
@@ -160,24 +250,36 @@ class TileOrchestrator:
 # Overture S3 query
 # ---------------------------------------------------------------------------
 
-def _query_overture(bbox: dict) -> list[dict]:
+def _query_overture(
+    bbox: dict,
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+) -> list[dict]:
     """
     Query the Overture Maps S3 Parquet files for water features
     within the given bounding box.
+
+    conn: optional existing DuckDB connection to reuse. When supplied,
+    extensions are assumed already loaded and the connection is left open
+    for the caller to manage. When omitted, a fresh connection is created,
+    initialised, used, and closed here.
+
+    Geometry is returned as raw WKB bytes — Shapely consumes this directly
+    via wkb.loads() in water.py, avoiding the GeoJSON serialisation overhead.
     """
     s3_path = OVERTURE_S3_TEMPLATE.format(release=OVERTURE_RELEASE)
 
-    sql = f"""
-        INSTALL spatial; LOAD spatial;
-        INSTALL httpfs;  LOAD httpfs;
-        SET s3_region = 'us-west-2';
+    logger.info(
+        "Fetching bbox: min_lat=%.6f, max_lat=%.6f, min_lng=%.6f, max_lng=%.6f",
+        bbox['min_lat'], bbox['max_lat'], bbox['min_lng'], bbox['max_lng'],
+    )
 
+    sql = f"""
         SELECT
             names.primary                               AS name,
             subtype,
             class,
             CAST(is_intermittent AS BOOLEAN)            AS is_intermittent,
-            ST_AsGeoJSON(geometry)                      AS geom_json
+            ST_AsWKB(geometry)                          AS geom_wkb
         FROM read_parquet('{s3_path}', hive_partitioning=1)
         WHERE bbox.xmin <= {bbox['max_lng']}
           AND bbox.xmax >= {bbox['min_lng']}
@@ -186,27 +288,27 @@ def _query_overture(bbox: dict) -> list[dict]:
     """
 
     try:
-        duck = duckdb.connect()
+        _own_conn = conn is None
+        duck = duckdb.connect() if _own_conn else conn
+        if _own_conn:
+            _init_connection(duck)
         rows = duck.execute(sql).fetchall()
-        duck.close()
+        if _own_conn:
+            duck.close()
     except Exception as exc:
         logger.error("Overture S3 fetch failed for bbox %s: %s", bbox, exc)
-        # Return empty list — TileOrchestrator will cache the empty result
-        # so we don't hammer S3 on every request after a transient failure.
-        # The tile will be considered stale after DATA_REFRESH_DAYS and retried.
         return []
 
     features = []
     for row in rows:
         if not row[4]:  # skip null geometries
             continue
-
         features.append({
-            "geometry": row[4],
+            "geometry": row[4],  # raw WKB bytes — parsed by wkb.loads() in water.py
             "name": row[0],
             "subtype": row[1],
             "class": row[2],
-            "is_salt": None,        # not in current Overture schema, inferred by water.py
+            "is_salt": None,     # not in current Overture schema, inferred by water.py
             "is_intermittent": row[3],
         })
 

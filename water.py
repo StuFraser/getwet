@@ -7,12 +7,13 @@ handles water class normalisation, confidence scoring, and nearest
 water body detection when a point falls outside any water feature.
 """
 
-import json
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from shapely.geometry import Point, shape
+import duckdb
+from shapely import wkb
+from shapely.geometry import Point
 from shapely.strtree import STRtree
 
 from tile_cache import TileOrchestrator
@@ -23,7 +24,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Water class normalisation
 # ---------------------------------------------------------------------------
-# Maps raw Overture/OSM class values to clean canonical categories.
 
 CLASS_NORMALISATION: dict[str, str] = {
     # Oceans / seas
@@ -72,7 +72,7 @@ SALT_BY_CATEGORY: dict[str, Optional[bool]] = {
     "river": False,
     "reservoir": False,
     "canal": False,
-    "wetland": None,    # could be either
+    "wetland": None,
     "water": None,
 }
 
@@ -90,8 +90,8 @@ class WaterResult:
     is_water: bool
     name: Optional[str]
     subtype: Optional[str]
-    water_class: Optional[str]      # raw Overture class value
-    category: Optional[str]         # normalised category
+    water_class: Optional[str]
+    category: Optional[str]
     is_salt: Optional[bool]
     is_intermittent: Optional[bool]
     confidence: str                 # "high" | "medium" | "low"
@@ -129,19 +129,27 @@ class WaterService:
     def __init__(self, orchestrator: Optional[TileOrchestrator] = None) -> None:
         self._orchestrator = orchestrator or TileOrchestrator()
 
-    def check(self, lat: float, lng: float, margin_m: float = 10.0) -> WaterResult:
+    def check(
+        self,
+        lat: float,
+        lng: float,
+        margin_m: float = 10.0,
+        conn: Optional[duckdb.DuckDBPyConnection] = None,
+    ) -> "WaterResult":
         """
         Check whether (lat, lng) falls within a water body.
 
-        margin_m: buffer in metres applied to the point before the
-        polygon test, to account for geometry imprecision in source data.
-        Defaults to 10m. Set to 0 for strict point-in-polygon behaviour.
+        margin_m: buffer in metres applied to the point before the polygon
+        test, to account for geometry imprecision in source data. Defaults
+        to 10m. Set to 0 for strict point-in-polygon behaviour.
+
+        conn: optional existing DuckDB connection to reuse on cache miss.
+        Passed through to TileOrchestrator unchanged — if the tile is
+        already cached, no connection is used at all.
         """
-        features = self._orchestrator.get_features_for_point(lat, lng)
+        features = self._orchestrator.get_features_for_point(lat, lng, conn=conn)
 
         if not features:
-            # No features available — either a genuinely dry/remote area
-            # or a transient S3 fetch failure. Return low confidence.
             return WaterResult(
                 is_water=False,
                 name=None,
@@ -156,30 +164,21 @@ class WaterService:
 
         # Shapely uses (x=lng, y=lat) coordinate order
         point = Point(lng, lat)
-        # Buffer the point by margin_m to account for geometry imprecision.
-        # Consumer controls this — set to 0 for strict point-in-polygon.
         point_buffered = point.buffer(margin_m / 111_000) if margin_m > 0 else point
 
-        geometries = [
-            shape(json.loads(f["geometry"]) if isinstance(f["geometry"], str) else f["geometry"])
-            for f in features
-        ]
+        geometries = [wkb.loads(f["geometry"]) for f in features]
         tree = STRtree(geometries)
 
         # --- Point-in-polygon ------------------------------------------------
         hits = tree.query(point_buffered, predicate="intersects")
 
         if len(hits) > 0:
-            # If multiple polygons contain the point (e.g. a river within
-            # a broader water body), pick the smallest — most specific match.
+            # Multiple hits — pick smallest (most specific) polygon.
             best_idx = min(hits, key=lambda i: geometries[i].area)
             feat = features[best_idx]
             raw_class = (feat.get("class") or "").lower()
             category = CLASS_NORMALISATION.get(raw_class, "water")
-
-            # is_salt is no longer in the Overture schema — infer from category
             is_salt = SALT_BY_CATEGORY.get(category)
-
             confidence = _boundary_confidence(point, geometries[best_idx])
             return WaterResult(
                 is_water=True,

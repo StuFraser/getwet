@@ -140,6 +140,8 @@ def check_water_batch(body: BatchRequest):
 
     Coordinates that fall within the same H3 tile (~250km²) share a single
     cache lookup, making batch requests within a region very efficient.
+    On cache misses, a shared DuckDB connection is created lazily by
+    TileOrchestrator and reused across all fetches in the batch.
     """
     results = []
     for coord in body.coordinates:
@@ -150,6 +152,14 @@ def check_water_batch(body: BatchRequest):
             **result.to_dict(),
         })
     return {"results": results, "count": len(results)}
+
+
+@app.post("/cache/warm", summary="Pre-warm tile cache for a location", dependencies=[Depends(require_api_key)])
+def warm_cache(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+):
+    return _orchestrator.warm(lat, lng)
 
 
 @app.get("/health", summary="Service health and cache statistics")

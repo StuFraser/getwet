@@ -4,7 +4,7 @@ tile_cache.py — H3-based tile orchestration.
 Sits between the water query logic and the cache backend. Responsible for:
   - Converting a lat/lng to an H3 cell
   - Checking the cache for a fresh tile
-  - Fetching from Overture S3 on cache miss or stale tile
+  - Fetching from Cloudflare R2 on cache miss or stale tile
   - Writing fetched features back to the cache
   - Exposing cache stats and stale tile eviction
 """
@@ -14,9 +14,6 @@ import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
-import json
-import urllib.request
 
 import duckdb
 import h3
@@ -31,47 +28,50 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DATA_REFRESH_DAYS: int = int(os.getenv("DATA_REFRESH_DAYS", "30"))
 
-_OVERTURE_RELEASE_OVERRIDE: str | None = os.getenv("OVERTURE_RELEASE")
+# ---------------------------------------------------------------------------
+# R2 configuration
+# ---------------------------------------------------------------------------
+R2_ENDPOINT      = os.getenv("R2_ENDPOINT")       # https://<account_id>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_KEY    = os.getenv("R2_SECRET_KEY")
+R2_BUCKET        = os.getenv("R2_BUCKET", "getwet")
+R2_PARQUET_KEY   = os.getenv("R2_PARQUET_KEY", "overture_water_global.parquet")
 
-
-def _resolve_overture_release() -> str:
-    """
-    Resolve the Overture release to query.
-    - If OVERTURE_RELEASE is set in .env, pin to that version.
-    - Otherwise fetch the latest from the Overture STAC catalog,
-      which rebuilds daily and always points to the current release.
-    - Falls back to a known-good release if the STAC request fails.
-    """
-    if _OVERTURE_RELEASE_OVERRIDE:
-        logger.info("Using pinned Overture release: %s", _OVERTURE_RELEASE_OVERRIDE)
-        return _OVERTURE_RELEASE_OVERRIDE
-
-    try:
-        with urllib.request.urlopen("https://stac.overturemaps.org", timeout=5) as resp:
-            data = json.loads(resp.read())
-            latest = data["latest"]
-            logger.info("Resolved latest Overture release from STAC: %s", latest)
-            return latest
-    except Exception as exc:
-        fallback = "2026-01-21.0"
-        logger.warning(
-            "Failed to resolve Overture release from STAC (%s) — using fallback: %s",
-            exc, fallback,
-        )
-        return fallback
-
-
-OVERTURE_RELEASE: str = _resolve_overture_release()
+# ---------------------------------------------------------------------------
+# Overture S3 configuration (preserved as fallback — commented out)
+# ---------------------------------------------------------------------------
+# import json
+# import urllib.request
+#
+# _OVERTURE_RELEASE_OVERRIDE: str | None = os.getenv("OVERTURE_RELEASE")
+#
+# def _resolve_overture_release() -> str:
+#     if _OVERTURE_RELEASE_OVERRIDE:
+#         logger.info("Using pinned Overture release: %s", _OVERTURE_RELEASE_OVERRIDE)
+#         return _OVERTURE_RELEASE_OVERRIDE
+#     try:
+#         with urllib.request.urlopen("https://stac.overturemaps.org", timeout=5) as resp:
+#             data = json.loads(resp.read())
+#             latest = data["latest"]
+#             logger.info("Resolved latest Overture release from STAC: %s", latest)
+#             return latest
+#     except Exception as exc:
+#         fallback = "2026-01-21.0"
+#         logger.warning(
+#             "Failed to resolve Overture release from STAC (%s) — using fallback: %s",
+#             exc, fallback,
+#         )
+#         return fallback
+#
+# OVERTURE_RELEASE: str = _resolve_overture_release()
+# OVERTURE_S3_TEMPLATE = (
+#     "s3://overturemaps-us-west-2/release/{release}/theme=base/type=water/*"
+# )
 
 # H3 resolution 5 — average cell area ~252 km².
 # Large enough to capture whole river/lake features,
 # small enough to avoid pulling too much data per fetch.
 H3_RESOLUTION: int = 5
-
-# Overture Maps public S3 path — no auth required.
-OVERTURE_S3_TEMPLATE = (
-    "s3://overturemaps-us-west-2/release/{release}/theme=base/type=water/*"
-)
 
 # Small bbox buffer in degrees (~5km) so features straddling
 # a cell boundary are captured. The point-in-polygon check in
@@ -85,12 +85,17 @@ BBOX_BUFFER_DEG: float = 0.05
 
 def _init_connection(conn: duckdb.DuckDBPyConnection) -> None:
     """
-    Install and load required DuckDB extensions on a fresh connection.
-    Safe to call once per connection — extensions persist for its lifetime.
+    Install and load required DuckDB extensions and configure R2 access
+    on a fresh connection. Safe to call once per connection — extensions
+    persist for its lifetime.
     """
     conn.execute("INSTALL spatial; LOAD spatial;")
-    conn.execute("INSTALL httpfs;  LOAD httpfs;")
-    conn.execute("SET s3_region = 'us-west-2';")
+    conn.execute("INSTALL httpfs; LOAD httpfs;")
+    conn.execute(f"SET s3_endpoint='{R2_ENDPOINT.replace('https://', '')}';")
+    conn.execute(f"SET s3_access_key_id='{R2_ACCESS_KEY_ID}';")
+    conn.execute(f"SET s3_secret_access_key='{R2_SECRET_KEY}';")
+    conn.execute("SET s3_region='auto';")
+    conn.execute("SET s3_url_style='path';")
 
 
 @contextmanager
@@ -104,7 +109,7 @@ def duck_connection():
     the intent is always to fetch all tiles in the ring.
 
     For on-demand paths (single check, batch with warm cache), connection
-    creation is deferred to _query_overture and only happens on actual
+    creation is deferred to _query_r2 and only happens on actual
     cache misses.
     """
     conn = duckdb.connect()
@@ -135,22 +140,22 @@ class TileOrchestrator:
     ) -> list[dict]:
         """
         Return all water features relevant to (lat, lng).
-        Fetches from Overture S3 on cache miss or stale tile.
+        Fetches from R2 on cache miss or stale tile.
 
         conn: optional existing DuckDB connection to reuse. Only used if a
         fetch is actually needed — cache hits return immediately without
         touching DuckDB at all. When omitted and a fetch is required, a
-        fresh connection is created and closed inside _query_overture.
+        fresh connection is created and closed inside _query_r2.
         """
         cell = h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
         cached = self._cache.get(cell)
 
         if cached is None:
-            logger.info("Cache miss for H3 cell %s — fetching from Overture S3", cell)
+            logger.info("Cache miss for H3 cell %s — fetching from R2", cell)
             return self._fetch_and_cache(cell, conn=conn)
 
         if self._is_stale(cached):
-            logger.info("Stale tile for H3 cell %s — refreshing from Overture S3", cell)
+            logger.info("Stale tile for H3 cell %s — refreshing from R2", cell)
             return self._fetch_and_cache(cell, conn=conn)
 
         logger.debug("Cache hit for H3 cell %s (%d features)", cell, cached.feature_count)
@@ -210,7 +215,8 @@ class TileOrchestrator:
             **base,
             "stale_tiles": len(stale),
             "refresh_days": DATA_REFRESH_DAYS,
-            "overture_release": OVERTURE_RELEASE,
+            "r2_bucket": R2_BUCKET,
+            "r2_parquet_key": R2_PARQUET_KEY,
         }
 
     # ------------------------------------------------------------------
@@ -229,13 +235,13 @@ class TileOrchestrator:
         conn: Optional[duckdb.DuckDBPyConnection] = None,
     ) -> list[dict]:
         """
-        Query Overture S3 for water features within the H3 cell bbox.
+        Query R2 for water features within the H3 cell bbox.
 
         conn: optional existing DuckDB connection to reuse. When omitted,
-        _query_overture creates and closes its own connection internally.
+        _query_r2 creates and closes its own connection internally.
         """
         bbox = _cell_bbox(cell)
-        features = _query_overture(bbox, conn=conn)
+        features = _query_r2(bbox, conn=conn)
 
         tile = CachedTile(
             h3_cell=cell,
@@ -247,16 +253,16 @@ class TileOrchestrator:
 
 
 # ---------------------------------------------------------------------------
-# Overture S3 query
+# R2 parquet query
 # ---------------------------------------------------------------------------
 
-def _query_overture(
+def _query_r2(
     bbox: dict,
     conn: Optional[duckdb.DuckDBPyConnection] = None,
 ) -> list[dict]:
     """
-    Query the Overture Maps S3 Parquet files for water features
-    within the given bounding box.
+    Query the consolidated R2 parquet for water features within the given
+    bounding box.
 
     conn: optional existing DuckDB connection to reuse. When supplied,
     extensions are assumed already loaded and the connection is left open
@@ -264,9 +270,9 @@ def _query_overture(
     initialised, used, and closed here.
 
     Geometry is returned as raw WKB bytes — Shapely consumes this directly
-    via wkb.loads() in water.py, avoiding the GeoJSON serialisation overhead.
+    via wkb.loads() in water.py, no changes needed there.
     """
-    s3_path = OVERTURE_S3_TEMPLATE.format(release=OVERTURE_RELEASE)
+    parquet_path = f"s3://{R2_BUCKET}/{R2_PARQUET_KEY}"
 
     logger.info(
         "Fetching bbox: min_lat=%.6f, max_lat=%.6f, min_lng=%.6f, max_lng=%.6f",
@@ -275,45 +281,96 @@ def _query_overture(
 
     sql = f"""
         SELECT
-            names.primary                               AS name,
+            name,
             subtype,
             class,
-            CAST(is_intermittent AS BOOLEAN)            AS is_intermittent,
-            ST_AsWKB(geometry)                          AS geom_wkb
-        FROM read_parquet('{s3_path}', hive_partitioning=1)
-        WHERE bbox.xmin <= {bbox['max_lng']}
-          AND bbox.xmax >= {bbox['min_lng']}
-          AND bbox.ymin <= {bbox['max_lat']}
-          AND bbox.ymax >= {bbox['min_lat']}
+            is_intermittent,
+            geom_wkb
+        FROM read_parquet('{parquet_path}')
+        WHERE min_lon <= {bbox['max_lng']}
+          AND max_lon >= {bbox['min_lng']}
+          AND min_lat <= {bbox['max_lat']}
+          AND max_lat >= {bbox['min_lat']}
     """
 
+    _own_conn = conn is None
+    duck = None
     try:
-        _own_conn = conn is None
         duck = duckdb.connect() if _own_conn else conn
         if _own_conn:
             _init_connection(duck)
         rows = duck.execute(sql).fetchall()
-        if _own_conn:
-            duck.close()
     except Exception as exc:
-        logger.error("Overture S3 fetch failed for bbox %s: %s", bbox, exc)
+        logger.error("R2 fetch failed for bbox %s: %s", bbox, exc)
         return []
+    finally:
+        if _own_conn and duck is not None:
+            duck.close()
 
     features = []
     for row in rows:
         if not row[4]:  # skip null geometries
             continue
         features.append({
-            "geometry": row[4],  # raw WKB bytes — parsed by wkb.loads() in water.py
+            "geometry": bytes(row[4]) if not isinstance(row[4], bytes) else row[4],
             "name": row[0],
             "subtype": row[1],
             "class": row[2],
-            "is_salt": None,     # not in current Overture schema, inferred by water.py
+            "is_salt": None,      # not in current schema, inferred by water.py
             "is_intermittent": row[3],
         })
 
-    logger.info("Fetched %d features from Overture S3", len(features))
+    logger.info("Fetched %d features from R2", len(features))
     return features
+
+
+# ---------------------------------------------------------------------------
+# Overture S3 query (preserved as fallback — commented out)
+# ---------------------------------------------------------------------------
+# def _query_overture(
+#     bbox: dict,
+#     conn: Optional[duckdb.DuckDBPyConnection] = None,
+# ) -> list[dict]:
+#     s3_path = OVERTURE_S3_TEMPLATE.format(release=OVERTURE_RELEASE)
+#     sql = f"""
+#         SELECT
+#             names.primary                               AS name,
+#             subtype,
+#             class,
+#             CAST(is_intermittent AS BOOLEAN)            AS is_intermittent,
+#             ST_AsWKB(geometry)                          AS geom_wkb
+#         FROM read_parquet('{s3_path}', hive_partitioning=1)
+#         WHERE bbox.xmin <= {bbox['max_lng']}
+#           AND bbox.xmax >= {bbox['min_lng']}
+#           AND bbox.ymin <= {bbox['max_lat']}
+#           AND bbox.ymax >= {bbox['min_lat']}
+#     """
+#     _own_conn = conn is None
+#     duck = None
+#     try:
+#         duck = duckdb.connect() if _own_conn else conn
+#         if _own_conn:
+#             _init_connection(duck)
+#         rows = duck.execute(sql).fetchall()
+#     except Exception as exc:
+#         logger.error("Overture S3 fetch failed for bbox %s: %s", bbox, exc)
+#         return []
+#     finally:
+#         if _own_conn and duck is not None:
+#             duck.close()
+#     features = []
+#     for row in rows:
+#         if not row[4]:
+#             continue
+#         features.append({
+#             "geometry": row[4],
+#             "name": row[0],
+#             "subtype": row[1],
+#             "class": row[2],
+#             "is_salt": None,
+#             "is_intermittent": row[3],
+#         })
+#     return features
 
 
 # ---------------------------------------------------------------------------

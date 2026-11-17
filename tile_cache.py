@@ -2,6 +2,8 @@
 
 import logging
 import os
+import threading
+from concurrent.futures import Future
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -15,6 +17,10 @@ from cache.base import BaseTileCache, CachedTile
 logger = logging.getLogger(__name__)
 
 DATA_REFRESH_DAYS: int = int(os.getenv("DATA_REFRESH_DAYS", "30"))
+MAX_CONCURRENT_OVERTURE_FETCHES: int = max(
+    1, int(os.getenv("MAX_CONCURRENT_OVERTURE_FETCHES", "2"))
+)
+_REMOTE_FETCH_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_OVERTURE_FETCHES)
 
 # Pin a release for repeatable results. Update deliberately after validation.
 OVERTURE_RELEASE: str = os.getenv("OVERTURE_RELEASE", "2026-10-21.0")
@@ -25,6 +31,10 @@ OVERTURE_S3_TEMPLATE = (
 # H3 is a request-cache key, not a data-partition scheme.
 H3_RESOLUTION: int = 5
 BBOX_BUFFER_DEG: float = 0.05
+
+
+class OvertureQueryError(RuntimeError):
+    """A remote Overture query failed, so no cache entry was written."""
 
 
 def _init_connection(conn: duckdb.DuckDBPyConnection) -> None:
@@ -60,6 +70,8 @@ class TileOrchestrator:
 
     def __init__(self, cache: Optional[BaseTileCache] = None) -> None:
         self._cache = cache or get_cache()
+        self._inflight_lock = threading.Lock()
+        self._inflight: dict[str, Future[list[dict]]] = {}
 
     def get_features_for_point(
         self,
@@ -68,15 +80,7 @@ class TileOrchestrator:
         conn: Optional[duckdb.DuckDBPyConnection] = None,
     ) -> list[dict]:
         cell = h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
-        cached = self._cache.get(cell)
-        if cached is None:
-            logger.info("Cache miss for H3 cell %s — fetching from Overture", cell)
-            return self._fetch_and_cache(cell, conn=conn)
-        if self._is_stale(cached):
-            logger.info("Stale H3 cell %s — refreshing from Overture", cell)
-            return self._fetch_and_cache(cell, conn=conn)
-        logger.debug("Cache hit for H3 cell %s (%d features)", cell, cached.feature_count)
-        return cached.features
+        return self._get_or_fetch(cell, conn=conn)
 
     def warm(self, lat: float, lng: float) -> dict:
         """Warm the centre H3 cell and its ring-1 neighbours using one connection."""
@@ -85,11 +89,17 @@ class TileOrchestrator:
         warmed: list[str] = []
         already_warm: list[str] = []
 
+        cells_to_fetch = [
+            cell for cell in cells
+            if self._needs_fetch(cell)
+        ]
+        if not cells_to_fetch:
+            return {"status": "ok", "warmed": 0, "already_warm": len(cells)}
+
         with duck_connection() as conn:
             for cell in cells:
-                cached = self._cache.get(cell)
-                if cached is None or self._is_stale(cached):
-                    self._fetch_and_cache(cell, conn=conn)
+                if self._needs_fetch(cell):
+                    self._get_or_fetch(cell, conn=conn)
                     warmed.append(cell)
                 else:
                     already_warm.append(cell)
@@ -113,21 +123,68 @@ class TileOrchestrator:
     def _is_stale(self, tile: CachedTile) -> bool:
         return tile.fetched_at < self._stale_threshold()
 
+    def _needs_fetch(self, cell: str) -> bool:
+        cached = self._cache.get(cell)
+        return cached is None or self._is_stale(cached)
+
     def _stale_threshold(self) -> datetime:
         return datetime.now(timezone.utc) - timedelta(days=DATA_REFRESH_DAYS)
 
-    def _fetch_and_cache(
+    def _get_or_fetch(
         self,
         cell: str,
         conn: Optional[duckdb.DuckDBPyConnection] = None,
     ) -> list[dict]:
-        features = _query_overture(_cell_bbox(cell), conn=conn)
-        self._cache.set(CachedTile(
-            h3_cell=cell,
-            fetched_at=datetime.now(timezone.utc),
-            features=features,
-        ))
-        return features
+        """
+        Return a fresh tile, coalescing simultaneous misses for the same cell.
+
+        The thread elected as leader performs the remote query. Other callers
+        wait on its Future rather than opening their own DuckDB connection or
+        querying the same Overture bbox. A failed leader publishes an exception
+        and never creates an empty cache tile.
+        """
+        cached = self._cache.get(cell)
+        if cached is not None and not self._is_stale(cached):
+            logger.debug("Cache hit for H3 cell %s (%d features)", cell, cached.feature_count)
+            return cached.features
+
+        with self._inflight_lock:
+            # Recheck after acquiring the lock: another request may have
+            # completed the fetch between the initial cache read and now.
+            cached = self._cache.get(cell)
+            if cached is not None and not self._is_stale(cached):
+                return cached.features
+
+            future = self._inflight.get(cell)
+            is_leader = future is None
+            if is_leader:
+                future = Future()
+                self._inflight[cell] = future
+
+        if not is_leader:
+            logger.info("Joining in-flight Overture fetch for H3 cell %s", cell)
+            return future.result()
+
+        try:
+            logger.info("Fetching H3 cell %s from Overture", cell)
+            with _REMOTE_FETCH_SEMAPHORE:
+                features = _query_overture(_cell_bbox(cell), conn=conn)
+            self._cache.set(CachedTile(
+                h3_cell=cell,
+                fetched_at=datetime.now(timezone.utc),
+                features=features,
+            ))
+            future.set_result(features)
+            return features
+        except Exception as exc:
+            error = exc if isinstance(exc, OvertureQueryError) else OvertureQueryError(
+                f"Overture fetch failed for H3 cell {cell}"
+            )
+            future.set_exception(error)
+            raise error from exc
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(cell, None)
 
 
 def _query_overture(
@@ -152,16 +209,17 @@ def _query_overture(
     """
 
     own_connection = conn is None
-    duck = conn or duckdb.connect()
+    duck = None
     try:
+        duck = conn or duckdb.connect()
         if own_connection:
             _init_connection(duck)
         rows = duck.execute(sql).fetchall()
     except Exception as exc:
         logger.error("Overture fetch failed for bbox %s: %s", bbox, exc)
-        return []
+        raise OvertureQueryError("Could not read Overture Water data") from exc
     finally:
-        if own_connection:
+        if own_connection and duck is not None:
             duck.close()
 
     features = []

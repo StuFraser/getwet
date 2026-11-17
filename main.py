@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-from tile_cache import TileOrchestrator
+from tile_cache import OvertureQueryError, TileOrchestrator
 from water import WaterService
 
 # ---------------------------------------------------------------------------
@@ -73,6 +73,15 @@ def require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
             detail="Invalid or missing API key.",
             headers={"WWW-Authenticate": "ApiKey"},
         )
+
+
+def overture_unavailable(exc: OvertureQueryError) -> HTTPException:
+    logger.warning("Overture query unavailable: %s", exc)
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Water data is temporarily unavailable. Please retry.",
+        headers={"Retry-After": "5"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +139,10 @@ def check_water(
     - `confidence` — "high" | "medium" | "low"
     - `nearest_water` — name, category, class, distance_m (when is_water=false)
     """
-    result = _service.check(lat, lng, margin_m=margin_m)
+    try:
+        result = _service.check(lat, lng, margin_m=margin_m)
+    except OvertureQueryError as exc:
+        raise overture_unavailable(exc) from exc
     return result.to_dict()
 
 
@@ -148,14 +160,17 @@ def check_water_batch(body: BatchRequest):
     On cache misses, a shared DuckDB connection is created lazily by
     TileOrchestrator and reused across all fetches in the batch.
     """
-    results = []
-    for coord in body.coordinates:
-        result = _service.check(coord.lat, coord.lng, margin_m=body.margin_m)
-        results.append({
-            "lat": coord.lat,
-            "lng": coord.lng,
-            **result.to_dict(),
-        })
+    try:
+        results = []
+        for coord in body.coordinates:
+            result = _service.check(coord.lat, coord.lng, margin_m=body.margin_m)
+            results.append({
+                "lat": coord.lat,
+                "lng": coord.lng,
+                **result.to_dict(),
+            })
+    except OvertureQueryError as exc:
+        raise overture_unavailable(exc) from exc
     return {"results": results, "count": len(results)}
 
 
@@ -164,7 +179,10 @@ def warm_cache(
     lat: float = Query(..., ge=-90, le=90),
     lng: float = Query(..., ge=-180, le=180),
 ):
-    return _orchestrator.warm(lat, lng)
+    try:
+        return _orchestrator.warm(lat, lng)
+    except OvertureQueryError as exc:
+        raise overture_unavailable(exc) from exc
 
 
 @app.get("/health", summary="Service health and cache statistics")

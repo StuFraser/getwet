@@ -13,6 +13,7 @@ No regional data files. No upfront downloads. No billing surprises.
 - **Global coverage** — works for any coordinate on Earth, not just preconfigured regions
 - **On-demand Overture queries** — DuckDB fetches only the bbox-relevant features from Overture's public GeoParquet release
 - **In-memory tile cache** — subsequent queries in the same area are instant
+- **Request coalescing** — concurrent checks and cache warm-ups for the same tile share one Overture fetch
 - **Point-in-water detection** — is a given lat/lng within a water body?
 - **Water type classification** — ocean, lake, river, reservoir, estuary, harbour, wetland, canal, and more
 - **Normalised categories** — clean canonical category alongside the raw Overture class
@@ -272,6 +273,7 @@ Tiles are also refreshed lazily on next query — this endpoint is optional, use
 | `CACHE_BACKEND` | ❌ | `memory` | Cache backend. Currently supports `memory` |
 | `DATA_REFRESH_DAYS` | ❌ | `30` | Days before a cached tile is considered stale |
 | `OVERTURE_RELEASE` | ❌ | `2026-10-21.0` | Pinned Overture release used for direct public-S3 queries |
+| `MAX_CONCURRENT_OVERTURE_FETCHES` | ❌ | `2` | Maximum simultaneous remote Overture reads per application process |
 
 ---
 

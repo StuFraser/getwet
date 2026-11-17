@@ -8,6 +8,7 @@ is a performance convenience rather than a critical data store.
 """
 
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -20,8 +21,9 @@ class MemoryTileCache(BaseTileCache):
     """
     In-memory cache backend.
 
-    Thread safety: Python's GIL provides sufficient protection for
-    simple dict reads/writes in a single-process FastAPI/uvicorn setup.
+    Thread safety: all compound access is protected by an RLock. The
+    orchestrator handles in-flight fetch coalescing; this lock keeps cache
+    reads, writes, iteration, and statistics internally consistent.
     If you move to multi-worker (multiple uvicorn workers), each worker
     will have its own independent cache — that's fine, just means more
     S3 fetches on first hit per worker.
@@ -29,33 +31,39 @@ class MemoryTileCache(BaseTileCache):
 
     def __init__(self) -> None:
         self._store: dict[str, CachedTile] = {}
+        self._lock = threading.RLock()
         logger.info("Memory tile cache initialised")
 
     def get(self, h3_cell: str) -> Optional[CachedTile]:
-        return self._store.get(h3_cell)
+        with self._lock:
+            return self._store.get(h3_cell)
 
     def set(self, tile: CachedTile) -> None:
-        self._store[tile.h3_cell] = tile
+        with self._lock:
+            self._store[tile.h3_cell] = tile
         logger.debug("Cached tile %s (%d features)", tile.h3_cell, tile.feature_count)
 
     def delete(self, h3_cell: str) -> None:
-        self._store.pop(h3_cell, None)
+        with self._lock:
+            self._store.pop(h3_cell, None)
 
     def list_stale(self, older_than: datetime) -> list[str]:
-        return [
-            cell
-            for cell, tile in self._store.items()
-            if tile.fetched_at < older_than
-        ]
+        with self._lock:
+            return [
+                cell
+                for cell, tile in self._store.items()
+                if tile.fetched_at < older_than
+            ]
 
     def stats(self) -> dict:
-        total_tiles = len(self._store)
-        total_features = sum(t.feature_count for t in self._store.values())
-        oldest = (
-            min(t.fetched_at for t in self._store.values()).isoformat()
-            if self._store
-            else None
-        )
+        with self._lock:
+            total_tiles = len(self._store)
+            total_features = sum(t.feature_count for t in self._store.values())
+            oldest = (
+                min(t.fetched_at for t in self._store.values()).isoformat()
+                if self._store
+                else None
+            )
         return {
             "backend": "memory",
             "total_tiles": total_tiles,

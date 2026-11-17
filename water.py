@@ -178,7 +178,10 @@ class WaterService:
             feat = features[best_idx]
             raw_class = (feat.get("class") or "").lower()
             category = CLASS_NORMALISATION.get(raw_class, "water")
-            is_salt = SALT_BY_CATEGORY.get(category)
+            # Prefer Overture's source value; infer only when it is absent.
+            is_salt = feat.get("is_salt")
+            if is_salt is None:
+                is_salt = SALT_BY_CATEGORY.get(category)
             confidence = _boundary_confidence(point, geometries[best_idx])
             return WaterResult(
                 is_water=True,

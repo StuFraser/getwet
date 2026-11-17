@@ -11,7 +11,7 @@ No regional data files. No upfront downloads. No billing surprises.
 ## ✨ Features
 
 - **Global coverage** — works for any coordinate on Earth, not just preconfigured regions
-- **On-demand tile fetching** — only fetches the ~250km² H3 tile covering your coordinate from a consolidated Cloudflare R2 parquet file
+- **On-demand Overture queries** — DuckDB fetches only the bbox-relevant features from Overture's public GeoParquet release
 - **In-memory tile cache** — subsequent queries in the same area are instant
 - **Point-in-water detection** — is a given lat/lng within a water body?
 - **Water type classification** — ocean, lake, river, reservoir, estuary, harbour, wetland, canal, and more
@@ -53,12 +53,7 @@ Edit `.env`:
 API_KEY=your-random-secret-key-here
 CACHE_BACKEND=memory
 DATA_REFRESH_DAYS=30
-
-R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
-R2_ACCESS_KEY_ID=your-read-only-access-key
-R2_SECRET_KEY=your-read-only-secret-key
-R2_BUCKET=getwet
-R2_PARQUET_KEY=overture_water_global.parquet
+OVERTURE_RELEASE=2026-10-21.0
 ```
 
 ### Run
@@ -67,7 +62,10 @@ R2_PARQUET_KEY=overture_water_global.parquet
 uvicorn main:app --reload
 ```
 
-The API is available at `http://localhost:8000`. On first query for any area the service fetches just the relevant tile from R2 — no upfront download required. First query cold start is typically 2–12s; subsequent queries in the same area are served from the in-memory cache.
+The API is available at `http://localhost:8000`. On the first query for an area,
+DuckDB reads the relevant Overture Water features directly from public S3; no
+local data download or cloud-storage credentials are required. Subsequent
+queries in the same H3 cell are served from the in-memory cache.
 
 ---
 
@@ -247,8 +245,7 @@ Service health check and cache statistics. No API key required.
     "oldest_tile": "2026-03-01T21:00:00+00:00",
     "stale_tiles": 0,
     "refresh_days": 30,
-    "r2_bucket": "getwet",
-    "r2_parquet_key": "overture_water_global.parquet"
+    "overture_release": "2026-10-21.0"
   }
 }
 ```
@@ -274,11 +271,7 @@ Tiles are also refreshed lazily on next query — this endpoint is optional, use
 | `API_KEY` | ✅ | — | Static API key for request authentication |
 | `CACHE_BACKEND` | ❌ | `memory` | Cache backend. Currently supports `memory` |
 | `DATA_REFRESH_DAYS` | ❌ | `30` | Days before a cached tile is considered stale |
-| `R2_ENDPOINT` | ✅ | — | Cloudflare R2 S3-compatible endpoint (`https://<account_id>.r2.cloudflarestorage.com`) |
-| `R2_ACCESS_KEY_ID` | ✅ | — | R2 read-only access key ID |
-| `R2_SECRET_KEY` | ✅ | — | R2 read-only secret key |
-| `R2_BUCKET` | ❌ | `getwet` | R2 bucket name |
-| `R2_PARQUET_KEY` | ❌ | `overture_water_global.parquet` | Parquet file key within the bucket |
+| `OVERTURE_RELEASE` | ❌ | `2026-10-21.0` | Pinned Overture release used for direct public-S3 queries |
 
 ---
 
@@ -288,16 +281,11 @@ Tiles are also refreshed lazily on next query — this endpoint is optional, use
 overture-water-api/
 ├── main.py              # FastAPI app & routes
 ├── water.py             # Point-in-water query logic & classification
-├── tile_cache.py        # H3 tile orchestration & R2 parquet fetching
+├── tile_cache.py        # H3 tile orchestration & direct Overture querying
 ├── cache/
 │   ├── __init__.py      # Backend factory (reads CACHE_BACKEND env var)
 │   ├── base.py          # Abstract cache interface
 │   └── memory.py        # In-memory backend
-├── scripts/
-│   ├── raw_parquet.py          # Extracts raw Overture data to local parquet
-│   ├── generate_simplified.py  # Applies tiered geometry simplification
-│   ├── upload_to_r2.py         # Uploads consolidated parquet to R2
-│   └── WATER_DATA_REFRESH.md   # Data refresh process documentation
 ├── .env.example
 ├── requirements.txt
 └── Dockerfile
@@ -316,15 +304,20 @@ Check in-memory tile cache
   ├─ HIT + fresh  →  query local features  →  return result
   └─ MISS / stale
           ↓
-    Fetch bbox from Cloudflare R2
-    (DuckDB spatial query on consolidated parquet file)
+    Fetch bbox from Overture public S3
+    (DuckDB spatial query on pinned GeoParquet release)
           ↓
     Store tile in memory cache
           ↓
     Query local features  →  return result
 ```
 
-Water features are stored as a single consolidated parquet file (~3.4GB, 2.2M features) in Cloudflare R2, sourced from the Overture Maps Foundation. DuckDB queries only the relevant bbox slice via the file footer — no full file scan. On a cold DuckDB connection first query is typically 2–12s; warm queries run at ~130ms. The `/cache/warm` endpoint can be used at deploy time to front-load cold starts for a known area.
+Water features are read directly from Overture Maps' public, versioned
+GeoParquet release. The service pins a release so results are reproducible;
+update `OVERTURE_RELEASE` deliberately after testing a newer release. On a
+cold DuckDB connection the first remote query is slower because it loads remote
+Parquet metadata; subsequent queries on the same warm connection and H3 cache
+are faster. The `/cache/warm` endpoint preloads the centre cell and neighbours.
 
 ---
 
@@ -345,7 +338,7 @@ docker run -p 8000:8000 --env-file .env overture-water-api
 | Query Engine | DuckDB |
 | Spatial Index | Shapely STRtree |
 | Tile System | H3 (Uber) |
-| Data Source | Overture Maps (via Cloudflare R2) |
+| Data Source | Overture Maps (public S3 GeoParquet) |
 | Config | python-dotenv |
 
 ---
@@ -394,4 +387,3 @@ Data used at runtime carries its own licensing terms as described above.
 - [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) — Underlying community map data
 - [DuckDB](https://duckdb.org) — Blazing fast local analytics
 - [H3](https://h3geo.org) — Hexagonal spatial indexing
-- [Cloudflare R2](https://developers.cloudflare.com/r2/) — Zero-egress object storage
